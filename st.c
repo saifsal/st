@@ -158,6 +158,7 @@ static void csidump(void);
 static void csihandle(void);
 static void csiparse(void);
 static void csireset(void);
+static void osc_color_response(int, int, int);
 static int eschandle(uchar);
 static void strdump(void);
 static void strhandle(void);
@@ -327,24 +328,8 @@ size_t utf8validate(Rune *u, size_t i) {
   return i;
 }
 
-static const char base64_digits[] = {
-    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
-    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
-    0,  0,  0,  0,  0,  62, 0,  0,  0,  63, 52, 53, 54, 55, 56, 57, 58, 59, 60,
-    61, 0,  0,  0,  -1, 0,  0,  0,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10,
-    11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 0,  0,  0,  0,
-    0,  0,  26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
-    43, 44, 45, 46, 47, 48, 49, 50, 51, 0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
-    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
-    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
-    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
-    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
-    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
-    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
-    0,  0,  0,  0,  0,  0,  0,  0};
-
 char base64dec_getc(const char **src) {
-  while (**src && !isprint(**src))
+  while (**src && !isprint((unsigned char)**src))
     (*src)++;
   return **src ? *((*src)++) : '='; /* emulate padding if string ends */
 }
@@ -352,6 +337,12 @@ char base64dec_getc(const char **src) {
 char *base64dec(const char *src) {
   size_t in_len = strlen(src);
   char *result, *dst;
+  static const char base64_digits[256] = {
+      [43] = 62, 0,  0,  0,  63, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 0,
+      0,         0,  -1, 0,  0,  0,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9,
+      10,        11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+      0,         0,  0,  0,  0,  0,  26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+      36,        37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51};
 
   if (in_len % 4)
     in_len += 4 - (in_len % 4);
@@ -734,14 +725,15 @@ int ttynew(const char *line, char *cmd, const char *out, char **args) {
     break;
   case 0:
     close(iofd);
+    close(m);
     setsid(); /* create a new process group */
     dup2(s, 0);
     dup2(s, 1);
     dup2(s, 2);
     if (ioctl(s, TIOCSCTTY, NULL) < 0)
       die("ioctl TIOCSCTTY failed: %s\n", strerror(errno));
-    close(s);
-    close(m);
+    if (s > 2)
+      close(s);
 #ifdef __OpenBSD__
     if (pledge("stdio getpw proc exec", NULL) == -1)
       die("pledge\n");
@@ -877,7 +869,7 @@ void ttyresize(int tw, int th) {
     fprintf(stderr, "Couldn't set window size: %s\n", strerror(errno));
 }
 
-void ttyhangup() {
+void ttyhangup(void) {
   /* Send SIGHUP to shell */
   kill(pid, SIGHUP);
 }
@@ -1009,7 +1001,7 @@ void tscrollup(int orig, int n) {
 }
 
 void selscroll(int orig, int n) {
-  if (sel.ob.x == -1)
+  if (sel.ob.x == -1 || sel.alt != IS_SET(MODE_ALTSCREEN))
     return;
 
   if (BETWEEN(sel.nb.y, orig, term.bot) != BETWEEN(sel.ne.y, orig, term.bot)) {
@@ -1040,6 +1032,7 @@ void tnewline(int first_col) {
 void csiparse(void) {
   char *p = csiescseq.buf, *np;
   long int v;
+  int sep = ';'; /* colon or semi-colon, but not both */
 
   csiescseq.narg = 0;
   if (*p == '?') {
@@ -1057,7 +1050,9 @@ void csiparse(void) {
       v = -1;
     csiescseq.arg[csiescseq.narg++] = v;
     p = np;
-    if (*p != ';' || csiescseq.narg == ESC_ARG_SIZ)
+    if (sep == ';' && *p == ':')
+      sep = ':'; /* allow override to colon once */
+    if (*p != sep || csiescseq.narg == ESC_ARG_SIZ)
       break;
     p++;
   }
@@ -1510,7 +1505,7 @@ void csihandle(void) {
       ttywrite(vtiden, strlen(vtiden), 0);
     break;
   case 'b': /* REP -- if last char is printable print it <n> more times */
-    DEFAULT(csiescseq.arg[0], 1);
+    LIMIT(csiescseq.arg[0], 1, 65535);
     if (term.lastc)
       while (csiescseq.arg[0]-- > 0)
         tputc(term.lastc);
@@ -1568,7 +1563,7 @@ void csihandle(void) {
       }
       break;
     case 1: /* above */
-      if (term.c.y > 1)
+      if (term.c.y > 0)
         tclearregion(0, 0, term.col - 1, term.c.y - 1);
       tclearregion(0, term.c.y, term.c.x, term.c.y);
       break;
@@ -1593,6 +1588,8 @@ void csihandle(void) {
     }
     break;
   case 'S': /* SU -- Scroll <n> line up */
+    if (csiescseq.priv)
+      break;
     DEFAULT(csiescseq.arg[0], 1);
     tscrollup(term.top, csiescseq.arg[0]);
     break;
@@ -1633,11 +1630,18 @@ void csihandle(void) {
   case 'm': /* SGR -- Terminal attribute (color) */
     tsetattr(csiescseq.arg, csiescseq.narg);
     break;
-  case 'n': /* DSR – Device Status Report (cursor position) */
-    if (csiescseq.arg[0] == 6) {
+  case 'n': /* DSR -- Device Status Report */
+    switch (csiescseq.arg[0]) {
+    case 5: /* Status Report "OK" `0n` */
+      ttywrite("\033[0n", sizeof("\033[0n") - 1, 0);
+      break;
+    case 6: /* Report Cursor Position (CPR) "<row>;<column>R" */
       len =
           snprintf(buf, sizeof(buf), "\033[%i;%iR", term.c.y + 1, term.c.x + 1);
       ttywrite(buf, len, 0);
+      break;
+    default:
+      goto unknown;
     }
     break;
   case 'r': /* DECSTBM -- Set Scrolling Region */
@@ -1693,9 +1697,37 @@ void csidump(void) {
 
 void csireset(void) { memset(&csiescseq, 0, sizeof(csiescseq)); }
 
+void osc_color_response(int num, int index, int is_osc4) {
+  int n;
+  char buf[32];
+  unsigned char r, g, b;
+
+  if (xgetcolor(is_osc4 ? num : index, &r, &g, &b)) {
+    fprintf(stderr, "erresc: failed to fetch %s color %d\n",
+            is_osc4 ? "osc4" : "osc", is_osc4 ? num : index);
+    return;
+  }
+
+  n = snprintf(buf, sizeof buf, "\033]%s%d;rgb:%02x%02x/%02x%02x/%02x%02x\007",
+               is_osc4 ? "4;" : "", num, r, r, g, g, b, b);
+  if (n < 0 || n >= sizeof(buf)) {
+    fprintf(stderr, "error: %s while printing %s response\n",
+            n < 0 ? "snprintf failed" : "truncation occurred",
+            is_osc4 ? "osc4" : "osc");
+  } else {
+    ttywrite(buf, n, 1);
+  }
+}
+
 void strhandle(void) {
   char *p = NULL, *dec;
   int j, narg, par;
+  const struct {
+    int idx;
+    char *str;
+  } osc_table[] = {{defaultfg, "foreground"},
+                   {defaultbg, "background"},
+                   {defaultcs, "cursor"}};
 
   term.esc &= ~(ESC_STR_END | ESC_STR);
   strparse();
@@ -1729,16 +1761,38 @@ void strhandle(void) {
         }
       }
       return;
+    case 10:
+    case 11:
+    case 12:
+      if (narg < 2)
+        break;
+      p = strescseq.args[1];
+      if ((j = par - 10) < 0 || j >= LEN(osc_table))
+        break; /* shouldn't be possible */
+
+      if (!strcmp(p, "?")) {
+        osc_color_response(par, osc_table[j].idx, 0);
+      } else if (xsetcolorname(osc_table[j].idx, p)) {
+        fprintf(stderr, "erresc: invalid %s color: %s\n", osc_table[j].str, p);
+      } else {
+        tfulldirt();
+      }
+      return;
     case 4: /* color set */
       if (narg < 3)
         break;
       p = strescseq.args[2];
       /* FALLTHROUGH */
-    case 104: /* color reset, here p = NULL */
+    case 104: /* color reset */
       j = (narg > 1) ? atoi(strescseq.args[1]) : -1;
-      if (xsetcolorname(j, p)) {
-        if (par == 104 && narg <= 1)
+
+      if (p && !strcmp(p, "?")) {
+        osc_color_response(j, 0, 1);
+      } else if (xsetcolorname(j, p)) {
+        if (par == 104 && narg <= 1) {
+          xloadcols();
           return; /* color reset without parameter */
+        }
         fprintf(stderr, "erresc: invalid color j=%d, p=%s\n", j,
                 p ? p : "(null)");
       } else {
@@ -1746,7 +1800,7 @@ void strhandle(void) {
          * TODO if defaultbg color is changed, borders
          * are dirty
          */
-        redraw();
+        tfulldirt();
       }
       return;
     }
@@ -2084,6 +2138,7 @@ int eschandle(uchar ascii) {
     treset();
     resettitle();
     xloadcols();
+    xsetmode(0, MODE_HIDE);
     break;
   case '=': /* DECPAM -- Application keypad */
     xsetmode(1, MODE_APPKEYPAD);
@@ -2173,6 +2228,9 @@ check_control_code:
    * they must not cause conflicts with sequences.
    */
   if (control) {
+    /* in UTF-8 mode ignore handling C1 control characters */
+    if (IS_SET(MODE_UTF8) && ISCONTROLC1(u))
+      return;
     tcontrolcode(u);
     /*
      * control codes are not shown ever
@@ -2218,11 +2276,16 @@ check_control_code:
     gp = &term.line[term.c.y][term.c.x];
   }
 
-  if (IS_SET(MODE_INSERT) && term.c.x + width < term.col)
+  if (IS_SET(MODE_INSERT) && term.c.x + width < term.col) {
     memmove(gp + width, gp, (term.col - term.c.x - width) * sizeof(Glyph));
+    gp->mode &= ~ATTR_WIDE;
+  }
 
   if (term.c.x + width > term.col) {
-    tnewline(1);
+    if (IS_SET(MODE_WRAP))
+      tnewline(1);
+    else
+      tmoveto(term.col - width, term.c.y);
     gp = &term.line[term.c.y][term.c.x];
   }
 
@@ -2232,6 +2295,10 @@ check_control_code:
   if (width == 2) {
     gp->mode |= ATTR_WIDE;
     if (term.c.x + 1 < term.col) {
+      if (gp[1].mode == ATTR_WIDE && term.c.x + 2 < term.col) {
+        gp[2].u = ' ';
+        gp[2].mode &= ~ATTR_WDUMMY;
+      }
       gp[1].u = '\0';
       gp[1].mode = ATTR_WDUMMY;
     }

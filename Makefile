@@ -7,20 +7,13 @@ include config.mk
 SRC = st.c x.c
 OBJ = $(SRC:.c=.o)
 
-all: options st
-
-options:
-	@echo st build options:
-	@echo "CFLAGS  = $(STCFLAGS)"
-	@echo "LDFLAGS = $(STLDFLAGS)"
-	@echo "CC      = $(CC)"
+all: st
 
 config.h:
 	cp config.def.h config.h
 
 .c.o:
 	$(CC) $(STCFLAGS) -c $<
-	strip $@
 
 st.o: config.h st.h win.h
 x.o: arg.h config.h st.h win.h
@@ -29,7 +22,6 @@ $(OBJ): config.h config.mk
 
 st: $(OBJ)
 	$(CC) -o $@ $(OBJ) $(STLDFLAGS)
-	strip $@
 
 clean:
 	rm -f st $(OBJ) st-$(VERSION).tar.gz
@@ -56,4 +48,4 @@ uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/st
 	rm -f $(DESTDIR)$(MANPREFIX)/man1/st.1
 
-.PHONY: all options clean dist install uninstall
+.PHONY: all clean dist install uninstall
