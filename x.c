@@ -105,6 +105,7 @@ typedef struct {
   XSetWindowAttributes attrs;
   int scr;
   int isfixed; /* is fixed geometry? */
+  int depth;   /* bit depth */
   int l, t;    /* left and top offset */
   int gm;      /* geometry mask */
 } XWindow;
@@ -248,7 +249,7 @@ static char *opt_line = NULL;
 static char *opt_name = NULL;
 static char *opt_title = NULL;
 
-static int oldbutton = 3; /* button event on startup: 3 = release */
+static uint buttons; /* bit field of pressed buttons */
 
 void clipcopy(const Arg *dummy) {
   Atom clipboard;
@@ -332,58 +333,66 @@ void mousesel(XEvent *e, int done) {
 }
 
 void mousereport(XEvent *e) {
-  int len, x = evcol(e), y = evrow(e), button = e->xbutton.button,
-           state = e->xbutton.state;
+  int len, btn, code;
+  int x = evcol(e), y = evrow(e);
+  int state = e->xbutton.state;
   char buf[40];
   static int ox, oy;
 
-  /* from urxvt */
-  if (e->xbutton.type == MotionNotify) {
+  if (e->type == MotionNotify) {
     if (x == ox && y == oy)
       return;
     if (!IS_SET(MODE_MOUSEMOTION) && !IS_SET(MODE_MOUSEMANY))
       return;
-    /* MOUSE_MOTION: no reporting if no button is pressed */
-    if (IS_SET(MODE_MOUSEMOTION) && oldbutton == 3)
+    /* MODE_MOUSEMOTION: no reporting if no button is pressed */
+    if (IS_SET(MODE_MOUSEMOTION) && buttons == 0)
       return;
-
-    button = oldbutton + 32;
-    ox = x;
-    oy = y;
+    /* Set btn to lowest-numbered pressed button, or 12 if no
+     * buttons are pressed. */
+    for (btn = 1; btn <= 11 && !(buttons & (1 << (btn - 1))); btn++)
+      ;
+    code = 32;
   } else {
-    if (!IS_SET(MODE_MOUSESGR) && e->xbutton.type == ButtonRelease) {
-      button = 3;
-    } else {
-      button -= Button1;
-      if (button >= 7)
-        button += 128 - 7;
-      else if (button >= 3)
-        button += 64 - 3;
-    }
-    if (e->xbutton.type == ButtonPress) {
-      oldbutton = button;
-      ox = x;
-      oy = y;
-    } else if (e->xbutton.type == ButtonRelease) {
-      oldbutton = 3;
+    btn = e->xbutton.button;
+    /* Only buttons 1 through 11 can be encoded */
+    if (btn < 1 || btn > 11)
+      return;
+    if (e->type == ButtonRelease) {
       /* MODE_MOUSEX10: no button release reporting */
       if (IS_SET(MODE_MOUSEX10))
         return;
-      if (button == 64 || button == 65)
+      /* Don't send release events for the scroll wheel */
+      if (btn == 4 || btn == 5)
         return;
     }
+    code = 0;
   }
 
+  ox = x;
+  oy = y;
+
+  /* Encode btn into code. If no button is pressed for a motion event in
+   * MODE_MOUSEMANY, then encode it as a release. */
+  if ((!IS_SET(MODE_MOUSESGR) && e->type == ButtonRelease) || btn == 12)
+    code += 3;
+  else if (btn >= 8)
+    code += 128 + btn - 8;
+  else if (btn >= 4)
+    code += 64 + btn - 4;
+  else
+    code += btn - 1;
+
   if (!IS_SET(MODE_MOUSEX10)) {
-    button += ((state & ShiftMask) ? 4 : 0) + ((state & Mod4Mask) ? 8 : 0) +
-              ((state & ControlMask) ? 16 : 0);
+    code += ((state & ShiftMask) ? 4 : 0) +
+            ((state & Mod1Mask) ? 8 : 0) /* meta key: alt */
+            + ((state & ControlMask) ? 16 : 0);
   }
 
   if (IS_SET(MODE_MOUSESGR)) {
-    len = snprintf(buf, sizeof(buf), "\033[<%d;%d;%d%c", button, x + 1, y + 1,
-                   e->xbutton.type == ButtonRelease ? 'm' : 'M');
+    len = snprintf(buf, sizeof(buf), "\033[<%d;%d;%d%c", code, x + 1, y + 1,
+                   e->type == ButtonRelease ? 'm' : 'M');
   } else if (x < 223 && y < 223) {
-    len = snprintf(buf, sizeof(buf), "\033[M%c%c%c", 32 + button, 32 + x + 1,
+    len = snprintf(buf, sizeof(buf), "\033[M%c%c%c", 32 + code, 32 + x + 1,
                    32 + y + 1);
   } else {
     return;
@@ -420,8 +429,12 @@ int mouseaction(XEvent *e, uint release) {
 }
 
 void bpress(XEvent *e) {
+  int btn = e->xbutton.button;
   struct timespec now;
   int snap;
+
+  if (1 <= btn && btn <= 11)
+    buttons |= 1 << (btn - 1);
 
   if (IS_SET(MODE_MOUSE) && !(e->xbutton.state & forcemousemod)) {
     mousereport(e);
@@ -431,7 +444,7 @@ void bpress(XEvent *e) {
   if (mouseaction(e, 0))
     return;
 
-  if (e->xbutton.button == Button1) {
+  if (btn == Button1) {
     /*
      * If the user clicks below predefined timeouts specific
      * snapping behaviour is exposed.
@@ -615,6 +628,11 @@ void setsel(char *str, Time t) {
 void xsetsel(char *str) { setsel(str, CurrentTime); }
 
 void brelease(XEvent *e) {
+  int btn = e->xbutton.button;
+
+  if (1 <= btn && btn <= 11)
+    buttons &= ~(1 << (btn - 1));
+
   if (IS_SET(MODE_MOUSE) && !(e->xbutton.state & forcemousemod)) {
     mousereport(e);
     return;
@@ -622,7 +640,7 @@ void brelease(XEvent *e) {
 
   if (mouseaction(e, 1))
     return;
-  if (e->xbutton.button == Button1)
+  if (btn == Button1)
     mousesel(e, 1);
 }
 
@@ -658,8 +676,7 @@ void xresize(int col, int row) {
   win.th = row * win.ch;
 
   XFreePixmap(xw.dpy, xw.buf);
-  xw.buf =
-      XCreatePixmap(xw.dpy, xw.win, win.w, win.h, DefaultDepth(xw.dpy, xw.scr));
+  xw.buf = XCreatePixmap(xw.dpy, xw.win, win.w, win.h, xw.depth);
   XftDrawChange(xw.draw, xw.buf);
   xclear(0, 0, win.w, win.h);
 
@@ -710,13 +727,28 @@ void xloadcols(void) {
       else
         die("could not allocate color %d\n", i);
     }
+
+  dc.col[defaultbg].color.alpha = (unsigned short)(0xffff * alpha);
+  dc.col[defaultbg].pixel &= 0x00FFFFFF;
+  dc.col[defaultbg].pixel |= (unsigned char)(0xff * alpha) << 24;
   loaded = 1;
+}
+
+int xgetcolor(int x, unsigned char *r, unsigned char *g, unsigned char *b) {
+  if (!BETWEEN(x, 0, dc.collen - 1))
+    return 1;
+
+  *r = dc.col[x].color.red >> 8;
+  *g = dc.col[x].color.green >> 8;
+  *b = dc.col[x].color.blue >> 8;
+
+  return 0;
 }
 
 int xsetcolorname(int x, const char *name) {
   Color ncolor;
 
-  if (!BETWEEN(x, 0, dc.collen))
+  if (!BETWEEN(x, 0, dc.collen - 1))
     return 1;
 
   if (!xloadcolor(x, name, &ncolor))
@@ -724,6 +756,12 @@ int xsetcolorname(int x, const char *name) {
 
   XftColorFree(xw.dpy, xw.vis, xw.cmap, &dc.col[x]);
   dc.col[x] = ncolor;
+
+  if (x == defaultbg) {
+    dc.col[defaultbg].color.alpha = (unsigned short)(0xffff * alpha);
+    dc.col[defaultbg].pixel &= 0x00FFFFFF;
+    dc.col[defaultbg].pixel |= (unsigned char)(0xff * alpha) << 24;
+  }
 
   return 0;
 }
@@ -904,17 +942,20 @@ void xloadfonts(const char *fontstr, double fontsize) {
   win.ch = ceilf(dc.font.height * chscale);
 
   FcPatternDel(pattern, FC_SLANT);
-  FcPatternAddInteger(pattern, FC_SLANT, FC_SLANT_ITALIC);
+  if (!disableitalic)
+    FcPatternAddInteger(pattern, FC_SLANT, FC_SLANT_ITALIC);
   if (xloadfont(&dc.ifont, pattern))
     die("can't open font %s\n", fontstr);
 
   FcPatternDel(pattern, FC_WEIGHT);
-  FcPatternAddInteger(pattern, FC_WEIGHT, FC_WEIGHT_BOLD);
+  if (!disablebold)
+    FcPatternAddInteger(pattern, FC_WEIGHT, FC_WEIGHT_BOLD);
   if (xloadfont(&dc.ibfont, pattern))
     die("can't open font %s\n", fontstr);
 
   FcPatternDel(pattern, FC_SLANT);
-  FcPatternAddInteger(pattern, FC_SLANT, FC_SLANT_ROMAN);
+  if (!disableroman)
+    FcPatternAddInteger(pattern, FC_SLANT, FC_SLANT_ROMAN);
   if (xloadfont(&dc.bfont, pattern))
     die("can't open font %s\n", fontstr);
 
@@ -985,14 +1026,28 @@ int xicdestroy(XIC xim, XPointer client, XPointer call) {
 void xinit(int cols, int rows) {
   XGCValues gcvalues;
   Cursor cursor;
-  Window parent;
+  Window parent, root;
   pid_t thispid = getpid();
   XColor xmousefg, xmousebg;
+  XWindowAttributes attr;
+  XVisualInfo vis;
 
   if (!(xw.dpy = XOpenDisplay(NULL)))
     die("can't open display\n");
   xw.scr = XDefaultScreen(xw.dpy);
-  xw.vis = XDefaultVisual(xw.dpy, xw.scr);
+
+  root = XRootWindow(xw.dpy, xw.scr);
+  if (!(opt_embed && (parent = strtol(opt_embed, NULL, 0))))
+    parent = root;
+
+  if (XMatchVisualInfo(xw.dpy, xw.scr, 32, TrueColor, &vis) != 0) {
+    xw.vis = vis.visual;
+    xw.depth = vis.depth;
+  } else {
+    XGetWindowAttributes(xw.dpy, parent, &attr);
+    xw.vis = attr.visual;
+    xw.depth = attr.depth;
+  }
 
   /* font */
   if (!FcInit())
@@ -1002,7 +1057,7 @@ void xinit(int cols, int rows) {
   xloadfonts(usedfont, 0);
 
   /* colors */
-  xw.cmap = XDefaultColormap(xw.dpy, xw.scr);
+  xw.cmap = XCreateColormap(xw.dpy, parent, xw.vis, None);
   xloadcols();
 
   /* adjust fixed window geometry */
@@ -1023,19 +1078,18 @@ void xinit(int cols, int rows) {
                         ButtonPressMask | ButtonReleaseMask;
   xw.attrs.colormap = xw.cmap;
 
-  if (!(opt_embed && (parent = strtol(opt_embed, NULL, 0))))
-    parent = XRootWindow(xw.dpy, xw.scr);
-  xw.win = XCreateWindow(xw.dpy, parent, xw.l, xw.t, win.w, win.h, 0,
-                         XDefaultDepth(xw.dpy, xw.scr), InputOutput, xw.vis,
+  xw.win = XCreateWindow(xw.dpy, parent, xw.l, xw.t, win.w, win.h, 0, xw.depth,
+                         InputOutput, xw.vis,
                          CWBackPixel | CWBorderPixel | CWBitGravity |
                              CWEventMask | CWColormap,
                          &xw.attrs);
+  if (parent != root)
+    XReparentWindow(xw.dpy, xw.win, parent, xw.l, xw.t);
 
   memset(&gcvalues, 0, sizeof(gcvalues));
   gcvalues.graphics_exposures = False;
-  dc.gc = XCreateGC(xw.dpy, parent, GCGraphicsExposures, &gcvalues);
-  xw.buf =
-      XCreatePixmap(xw.dpy, xw.win, win.w, win.h, DefaultDepth(xw.dpy, xw.scr));
+  dc.gc = XCreateGC(xw.dpy, xw.win, GCGraphicsExposures, &gcvalues);
+  xw.buf = XCreatePixmap(xw.dpy, xw.win, win.w, win.h, xw.depth);
   XSetForeground(xw.dpy, dc.gc, dc.col[defaultbg].pixel);
   XFillRectangle(xw.dpy, xw.buf, dc.gc, 0, 0, win.w, win.h);
 
@@ -1337,11 +1391,13 @@ void xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len,
 
   /* Render underline and strikethrough. */
   if (base.mode & ATTR_UNDERLINE) {
-    XftDrawRect(xw.draw, fg, winx, winy + dc.font.ascent + 1, width, 1);
+    XftDrawRect(xw.draw, fg, winx, winy + dc.font.ascent * chscale + 1, width,
+                1);
   }
 
   if (base.mode & ATTR_STRUCK) {
-    XftDrawRect(xw.draw, fg, winx, winy + 2 * dc.font.ascent / 3, width, 1);
+    XftDrawRect(xw.draw, fg, winx, winy + 2 * dc.font.ascent * chscale / 3,
+                width, 1);
   }
 
   /* Reset clip to none. */
@@ -1439,7 +1495,12 @@ void xseticontitle(char *p) {
   XTextProperty prop;
   DEFAULT(p, opt_title);
 
-  Xutf8TextListToTextProperty(xw.dpy, &p, 1, XUTF8StringStyle, &prop);
+  if (p[0] == '\0')
+    p = opt_title;
+
+  if (Xutf8TextListToTextProperty(xw.dpy, &p, 1, XUTF8StringStyle, &prop) !=
+      Success)
+    return;
   XSetWMIconName(xw.dpy, xw.win, &prop);
   XSetTextProperty(xw.dpy, xw.win, &prop, xw.netwmiconname);
   XFree(prop.value);
@@ -1449,7 +1510,12 @@ void xsettitle(char *p) {
   XTextProperty prop;
   DEFAULT(p, opt_title);
 
-  Xutf8TextListToTextProperty(xw.dpy, &p, 1, XUTF8StringStyle, &prop);
+  if (p[0] == '\0')
+    p = opt_title;
+
+  if (Xutf8TextListToTextProperty(xw.dpy, &p, 1, XUTF8StringStyle, &prop) !=
+      Success)
+    return;
   XSetWMName(xw.dpy, xw.win, &prop);
   XSetTextProperty(xw.dpy, xw.win, &prop, xw.netwmname);
   XFree(prop.value);
@@ -1609,7 +1675,7 @@ char *kmap(KeySym k, uint state) {
 
 void kpress(XEvent *ev) {
   XKeyEvent *e = &ev->xkey;
-  KeySym ksym;
+  KeySym ksym = NoSymbol;
   char buf[64], *customkey;
   int len;
   Rune c;
@@ -1619,10 +1685,13 @@ void kpress(XEvent *ev) {
   if (IS_SET(MODE_KBDLOCK))
     return;
 
-  if (xw.ime.xic)
+  if (xw.ime.xic) {
     len = XmbLookupString(xw.ime.xic, e, buf, sizeof buf, &ksym, &status);
-  else
+    if (status == XBufferOverflow)
+      return;
+  } else {
     len = XLookupString(e, buf, sizeof buf, &ksym, NULL);
+  }
   /* 1. shortcuts */
   for (bp = shortcuts; bp < shortcuts + LEN(shortcuts); bp++) {
     if (ksym == bp->keysym && match(bp->mod, e->state)) {
@@ -1800,6 +1869,10 @@ int main(int argc, char *argv[]) {
   ARGBEGIN {
   case 'a':
     allowaltscreen = 0;
+    break;
+  case 'A':
+    alpha = strtof(EARGF(usage()), NULL);
+    LIMIT(alpha, 0.0, 1.0);
     break;
   case 'c':
     opt_class = EARGF(usage());
